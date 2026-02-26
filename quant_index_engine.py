@@ -7,33 +7,35 @@ import statsmodels.api as sm
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 
 st.set_page_config(layout="wide")
 st.title("Institutional-Grade Index Event Forecasting Engine")
 
-# ==============================
+# =====================================
 # PARAMETERS
-# ==============================
+# =====================================
 TICKERS = ["AAPL","MSFT","GOOGL","AMZN","META","TSLA","NVDA","JPM","V","UNH",
            "HD","PG","MA","BAC","XOM","AVGO","COST","DIS","ADBE","CRM"]
 
 INDEX_SIZE = 10
 LOOKBACK = "3y"
-MONTE_CARLO_SIMS = 200   # reduced for stability
+MONTE_CARLO_SIMS = 200
 
-# ==============================
+# =====================================
 # LOAD DATA
-# ==============================
+# =====================================
 st.write("Loading market data...")
 
 data = yf.download(TICKERS, period=LOOKBACK, auto_adjust=True, progress=False)
+
+if data.empty:
+    st.error("Market data failed to load.")
+    st.stop()
 
 prices = data["Close"]
 volumes = data["Volume"]
 
 spx = yf.download("^GSPC", period=LOOKBACK, auto_adjust=True, progress=False)["Close"]
-vix = yf.download("^VIX", period=LOOKBACK, progress=False)["Close"]
 
 returns = prices.pct_change().dropna()
 spx_ret = spx.pct_change().dropna()
@@ -42,9 +44,9 @@ common_index = returns.index.intersection(spx_ret.index)
 returns = returns.loc[common_index]
 spx_ret = spx_ret.loc[common_index]
 
-# ==============================
+# =====================================
 # MARKET CAP
-# ==============================
+# =====================================
 st.write("Loading shares outstanding...")
 
 shares = {}
@@ -57,9 +59,9 @@ for t in TICKERS:
 shares = pd.Series(shares)
 market_cap = prices.mul(shares, axis=1)
 
-# ==============================
+# =====================================
 # MONTE CARLO RANKING
-# ==============================
+# =====================================
 st.write("Running Monte Carlo rank simulations...")
 
 latest_mc = market_cap.iloc[-1]
@@ -79,18 +81,22 @@ for _ in range(MONTE_CARLO_SIMS):
 
 rank_probs /= MONTE_CARLO_SIMS
 
-# ==============================
+# =====================================
 # FEATURES
-# ==============================
+# =====================================
 momentum = prices.pct_change(126).iloc[-1]
 volatility = returns.std()
 
 beta = {}
+
 for t in TICKERS:
-    y = returns[t].dropna()
-    X = sm.add_constant(spx_ret.loc[y.index])
-    model = sm.OLS(y, X).fit()
-    beta[t] = model.params.iloc[1]
+    if t in returns.columns:
+        y = returns[t]
+        X = sm.add_constant(spx_ret.loc[y.index])
+        model = sm.OLS(y, X).fit()
+        beta[t] = model.params.iloc[1]
+    else:
+        beta[t] = 1.0
 
 beta = pd.Series(beta)
 
@@ -101,9 +107,13 @@ features = pd.DataFrame({
     "beta": beta
 }).dropna()
 
-# ==============================
+if len(features) < INDEX_SIZE:
+    st.error("Not enough valid features to construct portfolio.")
+    st.stop()
+
+# =====================================
 # INCLUSION MODEL
-# ==============================
+# =====================================
 threshold = features["rank_prob"].median()
 y_label = (features["rank_prob"] > threshold).astype(int)
 
@@ -121,81 +131,57 @@ prob_gb = gb_model.predict_proba(X_scaled)[:, 1]
 
 features["ensemble_prob"] = (prob_log + prob_gb) / 2
 
-# ==============================
+# =====================================
 # SELECT PORTFOLIO
-# ==============================
+# =====================================
 selected = features.sort_values("ensemble_prob", ascending=False).index[:INDEX_SIZE]
-event_returns = returns[selected].mean(axis=1)
 
-# ==============================
+valid_selected = [t for t in selected if t in returns.columns]
+
+if len(valid_selected) == 0:
+    st.error("No valid selected stocks.")
+    st.stop()
+
+event_returns = returns[valid_selected].mean(axis=1)
+
+if event_returns.isna().all():
+    st.error("Event return calculation failed.")
+    st.stop()
+
+# =====================================
 # BETA HEDGE
-# ==============================
-beta_selected = beta[selected].mean()
+# =====================================
+beta_selected = beta[valid_selected].mean()
 hedged_returns = event_returns - beta_selected * spx_ret
 
-# ==============================
+# =====================================
 # LIQUIDITY COST
-# ==============================
+# =====================================
 impact_cost = 0.0005
-hedged_returns_adj = hedged_returns - impact_cost
+strategy_returns = hedged_returns - impact_cost
 
-# ==============================
-# FACTOR NEUTRALIZATION (SAFE)
-# ==============================
-pca = PCA(n_components=1)
-factor = pca.fit_transform(returns.fillna(0))
-factor_series = pd.Series(factor.flatten(), index=returns.index)
-
-strategy_df = pd.DataFrame({
-    "strategy": hedged_returns_adj
-})
-
-factor_df = pd.DataFrame({
-    "factor": factor_series
-})
-
-aligned = strategy_df.join(factor_df, how="inner").dropna()
-
-if len(aligned) > 10:
-    X = sm.add_constant(aligned["factor"])
-    model = sm.OLS(aligned["strategy"], X).fit()
-    factor_beta = model.params.iloc[1]
-    final_returns = aligned["strategy"] - factor_beta * aligned["factor"]
-else:
-    final_returns = hedged_returns_adj
-
-# ==============================
+# =====================================
 # PERFORMANCE
-# ==============================
-car = (1 + final_returns).cumprod()
+# =====================================
+car = (1 + strategy_returns).cumprod()
 
-if final_returns.std() != 0:
-    sharpe = np.sqrt(252) * final_returns.mean() / final_returns.std()
+if strategy_returns.std() != 0:
+    sharpe = np.sqrt(252) * strategy_returns.mean() / strategy_returns.std()
 else:
     sharpe = 0
 
 st.subheader(f"Annualized Sharpe: {round(sharpe,2)}")
 
-# ==============================
-# OPTIONS SKEW PROXY
-# ==============================
-vix_change = vix.pct_change().iloc[-1]
-st.write(f"Options Skew Proxy (VIX Change): {round(vix_change,4)}")
-
-# ==============================
-# SHORT CROWDING PROXY
-# ==============================
-short_proxy = volatility.rank(pct=True)
-st.write("Short Crowding Proxy (Volatility Rank):")
-st.write(short_proxy.sort_values(ascending=False).head())
-
-# ==============================
+# =====================================
 # PLOT
-# ==============================
+# =====================================
 fig, ax = plt.subplots(figsize=(10,6))
 ax.plot(car)
-ax.set_title("Factor-Neutral Index Event Strategy")
+ax.set_title("Index Event Pre-Positioning Strategy")
 st.pyplot(fig)
 
+# =====================================
+# DISPLAY OUTPUT
+# =====================================
 st.write("Top Inclusion Probabilities:")
 st.write(features.sort_values("ensemble_prob", ascending=False)[["ensemble_prob"]])
