@@ -20,7 +20,7 @@ TICKERS = ["AAPL","MSFT","GOOGL","AMZN","META","TSLA","NVDA","JPM","V","UNH",
 
 INDEX_SIZE = 10
 LOOKBACK = "3y"
-MONTE_CARLO_SIMS = 300
+MONTE_CARLO_SIMS = 200   # reduced for stability
 
 # ==============================
 # LOAD DATA
@@ -58,7 +58,7 @@ shares = pd.Series(shares)
 market_cap = prices.mul(shares, axis=1)
 
 # ==============================
-# MONTE CARLO RANKING (FIXED)
+# MONTE CARLO RANKING
 # ==============================
 st.write("Running Monte Carlo rank simulations...")
 
@@ -68,9 +68,10 @@ sigma = returns.std()
 rank_probs = pd.Series(0.0, index=TICKERS)
 
 for _ in range(MONTE_CARLO_SIMS):
-    shock_values = np.random.normal(0, sigma.values)
-    shock = pd.Series(shock_values, index=sigma.index)  # FIXED
-
+    shock = pd.Series(
+        np.random.normal(0, sigma.values),
+        index=sigma.index
+    )
     simulated_mc = latest_mc * (1 + shock)
     ranked = simulated_mc.sort_values(ascending=False)
     top = ranked.index[:INDEX_SIZE]
@@ -139,26 +140,39 @@ impact_cost = 0.0005
 hedged_returns_adj = hedged_returns - impact_cost
 
 # ==============================
-# FACTOR NEUTRALIZATION
+# FACTOR NEUTRALIZATION (SAFE)
 # ==============================
 pca = PCA(n_components=1)
 factor = pca.fit_transform(returns.fillna(0))
 factor_series = pd.Series(factor.flatten(), index=returns.index)
 
-aligned = pd.concat([hedged_returns_adj, factor_series], axis=1).dropna()
-aligned.columns = ["strategy", "factor"]
+strategy_df = pd.DataFrame({
+    "strategy": hedged_returns_adj
+})
 
-X = sm.add_constant(aligned["factor"])
-model = sm.OLS(aligned["strategy"], X).fit()
+factor_df = pd.DataFrame({
+    "factor": factor_series
+})
 
-factor_beta = model.params.iloc[1]
-final_returns = aligned["strategy"] - factor_beta * aligned["factor"]
+aligned = strategy_df.join(factor_df, how="inner").dropna()
+
+if len(aligned) > 10:
+    X = sm.add_constant(aligned["factor"])
+    model = sm.OLS(aligned["strategy"], X).fit()
+    factor_beta = model.params.iloc[1]
+    final_returns = aligned["strategy"] - factor_beta * aligned["factor"]
+else:
+    final_returns = hedged_returns_adj
 
 # ==============================
 # PERFORMANCE
 # ==============================
 car = (1 + final_returns).cumprod()
-sharpe = np.sqrt(252) * final_returns.mean() / final_returns.std()
+
+if final_returns.std() != 0:
+    sharpe = np.sqrt(252) * final_returns.mean() / final_returns.std()
+else:
+    sharpe = 0
 
 st.subheader(f"Annualized Sharpe: {round(sharpe,2)}")
 
