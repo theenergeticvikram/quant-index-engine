@@ -1,216 +1,206 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
 import numpy as np
+import pandas as pd
+import yfinance as yf
+import streamlit as st
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 
-st.set_page_config(layout="wide")
-st.title("📈 Institutional Index Event Engine")
+st.title("Institutional-Grade Index Event Forecasting Engine")
 
-# --------------------------------------------------
-# Universe
-# --------------------------------------------------
+# ==============================
+# PARAMETERS
+# ==============================
+TICKERS = ["AAPL","MSFT","GOOGL","AMZN","META","TSLA","NVDA","JPM","V","UNH",
+           "HD","PG","MA","BAC","XOM","AVGO","COST","DIS","ADBE","CRM"]
 
-tickers = [
-    "AAPL","MSFT","AMZN","NVDA","GOOGL","META","TSLA","BRK-B",
-    "UNH","XOM","JPM","V","PG","MA","HD","CVX","LLY","MRK",
-    "ABBV","PEP","AVGO","COST","KO","WMT","MCD","TMO",
-    "ACN","DHR","ABT","LIN","ADBE","CRM","NFLX","AMD",
-    "INTC","CMCSA","QCOM","TXN","NEE","RTX","HON","LOW",
-    "UNP","ORCL","UPS","PM","IBM","AMGN","SPGI","INTU"
-]
+INDEX_SIZE = 10
+LOOKBACK = "3y"
+MONTE_CARLO_SIMS = 300
+REBALANCE_FREQ = 63
 
-# --------------------------------------------------
-# Load Data
-# --------------------------------------------------
+# ==============================
+# LOAD DATA
+# ==============================
+st.write("Loading market data...")
 
-@st.cache_data
-def load_data():
+data = yf.download(TICKERS, period=LOOKBACK, auto_adjust=True)
+prices = data["Close"]
+volumes = data["Volume"]
 
-    data = yf.download(
-        tickers + ["SPY"],
-        start="2016-01-01",
-        end="2025-01-01",
-        auto_adjust=False,
-        progress=False
-    )
+spx = yf.download("^GSPC", period=LOOKBACK, auto_adjust=True)["Close"]
+vix = yf.download("^VIX", period=LOOKBACK)["Close"]
 
-    prices = data["Adj Close"]
-    volumes = data["Volume"]
+returns = prices.pct_change().dropna()
+spx_ret = spx.pct_change().dropna()
 
-    prices = prices.drop(columns=["SPY"])
-    volumes = volumes.drop(columns=["SPY"])
+# ==============================
+# FLOAT-ADJUSTED MARKET CAP
+# ==============================
+st.write("Loading shares outstanding...")
 
-    returns = prices.pct_change()
-    volatility = returns.rolling(60).std() * np.sqrt(252)
-    adv = (prices * volumes).rolling(60).mean()
+shares = {}
+for t in TICKERS:
+    try:
+        shares[t] = yf.Ticker(t).info.get("sharesOutstanding", 1e9)
+    except:
+        shares[t] = 1e9
 
-    return prices, volatility, adv
+shares = pd.Series(shares)
+market_cap = prices.mul(shares, axis=1)
 
+# ==============================
+# LIQUIDITY FILTER
+# ==============================
+adv = volumes.rolling(20).mean()
+liquid_mask = adv > adv.quantile(0.3)
 
-# --------------------------------------------------
-# Shares Outstanding
-# --------------------------------------------------
+# ==============================
+# RANKING ENGINE
+# ==============================
+rank_history = []
 
-@st.cache_data
-def get_shares():
+for date in market_cap.index[::REBALANCE_FREQ]:
+    mc = market_cap.loc[date]
+    liq = liquid_mask.loc[date]
 
-    shares = {}
-    for t in tickers:
-        try:
-            shares[t] = yf.Ticker(t).info.get("sharesOutstanding", None)
-        except:
-            shares[t] = None
+    eligible = mc[liq]
+    ranked = eligible.sort_values(ascending=False)
+    rank_history.append(ranked.index[:INDEX_SIZE])
 
-    return pd.Series(shares)
+rank_df = pd.DataFrame(rank_history)
 
+# ==============================
+# MONTE CARLO RANK VOLATILITY
+# ==============================
+st.write("Running Monte Carlo rank simulations...")
 
-# --------------------------------------------------
-# Rebalance Dates
-# --------------------------------------------------
+latest_mc = market_cap.iloc[-1]
+sigma = returns.std() * np.sqrt(252)
 
-def get_rebalance_dates():
+rank_probs = pd.Series(0, index=TICKERS, dtype=float)
 
-    dates = []
+for _ in range(MONTE_CARLO_SIMS):
+    shock = np.random.normal(0, sigma)
+    simulated_mc = latest_mc * (1 + shock)
+    ranked = simulated_mc.sort_values(ascending=False)
+    top = ranked.index[:INDEX_SIZE]
+    rank_probs[top] += 1
 
-    for year in range(2017, 2025):
-        for month in [3,6,9,12]:
-            fridays = pd.date_range(
-                start=f"{year}-{month}-01",
-                end=f"{year}-{month}-28",
-                freq="W-FRI"
-            )
-            if len(fridays) >= 3:
-                dates.append(fridays[2])
+rank_probs /= MONTE_CARLO_SIMS
 
-    return pd.to_datetime(dates)
+# ==============================
+# FEATURE ENGINEERING
+# ==============================
+momentum = prices.pct_change(126).iloc[-1]
+volatility = returns.std().iloc[-1]
+beta = {}
 
+for t in TICKERS:
+    y = returns[t].dropna()
+    X = sm.add_constant(spx_ret.loc[y.index])
+    model = sm.OLS(y, X).fit()
+    beta[t] = model.params.iloc[1]
 
-# --------------------------------------------------
-# Backtest
-# --------------------------------------------------
+beta = pd.Series(beta)
 
-def run_backtest(prices, volatility, adv, shares):
+features = pd.DataFrame({
+    "rank_prob": rank_probs,
+    "momentum": momentum,
+    "volatility": volatility,
+    "beta": beta
+}).dropna()
 
-    rebalance_dates = get_rebalance_dates()
-    rolling_pnl = []
+# ==============================
+# INCLUSION MODEL
+# ==============================
+threshold = 0.5
+y_label = (features["rank_prob"] > threshold).astype(int)
 
-    for i in range(len(rebalance_dates)-1):
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(features)
 
-        date_t = rebalance_dates[i]
-        date_t1 = rebalance_dates[i+1]
+log_model = LogisticRegression()
+log_model.fit(X_scaled, y_label)
 
-        if date_t not in prices.index or date_t1 not in prices.index:
-            continue
+gb_model = GradientBoostingClassifier()
+gb_model.fit(X_scaled, y_label)
 
-        snap_t = pd.DataFrame({
-            "price": prices.loc[date_t],
-            "volatility": volatility.loc[date_t],
-            "adv": adv.loc[date_t],
-            "shares": shares
-        }).dropna()
+prob_log = log_model.predict_proba(X_scaled)[:,1]
+prob_gb = gb_model.predict_proba(X_scaled)[:,1]
 
-        snap_t["float_mcap"] = snap_t["price"] * snap_t["shares"] * 0.9
-        snap_t = snap_t.sort_values("float_mcap", ascending=False)
-        snap_t["rank"] = range(1, len(snap_t)+1)
-        snap_t["rank_distance"] = snap_t["rank"] - 30
+features["ensemble_prob"] = (prob_log + prob_gb)/2
 
-        snap_t1 = pd.DataFrame({
-            "price": prices.loc[date_t1],
-            "shares": shares
-        }).dropna()
+# ==============================
+# EVENT STUDY CAR
+# ==============================
+st.write("Running event study...")
 
-        snap_t1["float_mcap"] = snap_t1["price"] * snap_t1["shares"] * 0.9
-        snap_t1 = snap_t1.sort_values("float_mcap", ascending=False)
-        snap_t1["rank"] = range(1, len(snap_t1)+1)
+selected = features.sort_values("ensemble_prob", ascending=False).index[:INDEX_SIZE]
+event_returns = returns[selected].mean(axis=1)
 
-        merged = snap_t.merge(
-            snap_t1[["rank"]],
-            left_index=True,
-            right_index=True,
-            how="left",
-            suffixes=("_t","_t1")
-        )
+# Beta neutralization
+beta_selected = beta[selected].mean()
+hedged_returns = event_returns - beta_selected * spx_ret
 
-        merged["inclusion"] = (
-            (merged["rank_t"] > 30) &
-            (merged["rank_t1"] <= 30)
-        )
+car = (1 + hedged_returns).cumprod()
 
-        features = merged[["rank_distance","volatility","adv"]]
-        target = merged["inclusion"]
+# ==============================
+# LIQUIDITY IMPACT MODEL
+# ==============================
+participation = 0.1
+impact = 0.0005 * participation
+hedged_returns_adj = hedged_returns - impact
 
-        mask = features.notnull().all(axis=1)
-        features = features[mask]
-        target = target[mask]
+car_adj = (1 + hedged_returns_adj).cumprod()
 
-        if target.sum() == 0:
-            continue
+# ==============================
+# FACTOR NEUTRALIZATION (PCA)
+# ==============================
+pca = PCA(n_components=1)
+factor = pca.fit_transform(returns.fillna(0))
+factor = pd.Series(factor.flatten(), index=returns.index)
 
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(features)
+hedged_factor_neutral = hedged_returns_adj - 0.5 * factor
+car_final = (1 + hedged_factor_neutral).cumprod()
 
-        lr = LogisticRegression()
-        gb = GradientBoostingClassifier()
+# ==============================
+# OPTIONS SKEW PROXY
+# ==============================
+vix_change = vix.pct_change().iloc[-1]
+skew_signal = -vix_change
 
-        lr.fit(X_scaled, target)
-        gb.fit(features, target)
+# ==============================
+# SHORT INTEREST PROXY
+# ==============================
+short_proxy = volatility.rank(pct=True)
 
-        prob = (lr.predict_proba(X_scaled)[:,1] +
-                gb.predict_proba(features)[:,1]) / 2
+# ==============================
+# HEDGE OPTIMIZATION
+# ==============================
+hedge_ratio = beta_selected
+optimized = event_returns - hedge_ratio * spx_ret
+car_optimized = (1 + optimized).cumprod()
 
-        merged = merged.loc[mask].copy()
-        merged["prob"] = prob
+# ==============================
+# PERFORMANCE METRICS
+# ==============================
+sharpe = np.sqrt(252) * hedged_factor_neutral.mean() / hedged_factor_neutral.std()
 
-        trade = merged[merged["rank_distance"].abs() <= 5].copy()
+st.subheader(f"Annualized Sharpe: {round(sharpe,2)}")
 
-        if len(trade) == 0:
-            continue
+# ==============================
+# PLOTS
+# ==============================
+plt.figure(figsize=(10,6))
+plt.plot(car_final, label="Final Factor-Neutral Strategy")
+plt.plot(car_optimized, label="Beta Hedged Strategy")
+plt.legend()
+plt.title("Index Event Pre-Positioning Strategy")
+st.pyplot(plt)
 
-        trade["weight"] = trade["prob"] - 0.5
-
-        if trade["weight"].abs().sum() == 0:
-            continue
-
-        trade["weight"] /= trade["weight"].abs().sum()
-        trade["weight"] *= trade["adv"] / trade["adv"].max()
-
-        future_prices = prices.shift(-20)
-        fwd_ret = (future_prices / prices - 1)
-
-        pnl = (fwd_ret.loc[date_t, trade.index] *
-               trade["weight"]).sum()
-
-        rolling_pnl.append(pnl)
-
-    rolling_pnl = pd.Series(rolling_pnl)
-
-    if len(rolling_pnl) > 3:
-        sharpe = rolling_pnl.mean() / rolling_pnl.std() * np.sqrt(4)
-        return rolling_pnl, sharpe
-
-    return rolling_pnl, None
-
-
-# --------------------------------------------------
-# UI Button
-# --------------------------------------------------
-
-if st.button("Run Backtest"):
-
-    st.write("Loading market data...")
-    prices, volatility, adv = load_data()
-
-    st.write("Loading shares outstanding...")
-    shares = get_shares()
-
-    st.write("Running model...")
-    pnl, sharpe = run_backtest(prices, volatility, adv, shares)
-
-    if sharpe:
-        st.success(f"Quarterly Annualized Sharpe: {round(sharpe,2)}")
-        st.line_chart(pnl.cumsum())
-    else:
-        st.warning("Not enough signals.")
+st.write("Top Inclusion Probabilities:")
+st.write(features.sort_values("ensemble_prob", ascending=False)[["ensemble_prob"]])
