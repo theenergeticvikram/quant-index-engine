@@ -38,7 +38,6 @@ vix = yf.download("^VIX", period=LOOKBACK, progress=False)["Close"]
 returns = prices.pct_change().dropna()
 spx_ret = spx.pct_change().dropna()
 
-# Align everything
 common_index = returns.index.intersection(spx_ret.index)
 returns = returns.loc[common_index]
 spx_ret = spx_ret.loc[common_index]
@@ -59,7 +58,7 @@ shares = pd.Series(shares)
 market_cap = prices.mul(shares, axis=1)
 
 # ==============================
-# MONTE CARLO RANKING
+# MONTE CARLO RANKING (FIXED)
 # ==============================
 st.write("Running Monte Carlo rank simulations...")
 
@@ -69,7 +68,9 @@ sigma = returns.std()
 rank_probs = pd.Series(0.0, index=TICKERS)
 
 for _ in range(MONTE_CARLO_SIMS):
-    shock = np.random.normal(0, sigma)
+    shock_values = np.random.normal(0, sigma.values)
+    shock = pd.Series(shock_values, index=sigma.index)  # FIXED
+
     simulated_mc = latest_mc * (1 + shock)
     ranked = simulated_mc.sort_values(ascending=False)
     top = ranked.index[:INDEX_SIZE]
@@ -138,13 +139,12 @@ impact_cost = 0.0005
 hedged_returns_adj = hedged_returns - impact_cost
 
 # ==============================
-# FACTOR NEUTRALIZATION (REGRESSION METHOD)
+# FACTOR NEUTRALIZATION
 # ==============================
 pca = PCA(n_components=1)
 factor = pca.fit_transform(returns.fillna(0))
 factor_series = pd.Series(factor.flatten(), index=returns.index)
 
-# Align series safely
 aligned = pd.concat([hedged_returns_adj, factor_series], axis=1).dropna()
 aligned.columns = ["strategy", "factor"]
 
@@ -152,7 +152,6 @@ X = sm.add_constant(aligned["factor"])
 model = sm.OLS(aligned["strategy"], X).fit()
 
 factor_beta = model.params.iloc[1]
-
 final_returns = aligned["strategy"] - factor_beta * aligned["factor"]
 
 # ==============================
